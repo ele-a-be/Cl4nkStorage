@@ -17,7 +17,12 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 async def get_db():
-    structure = {"files": [], "next_id": 1, "clipboard": {}}
+    structure = {
+        "files": [], 
+        "next_id": 1, 
+        "clipboard": {}, 
+        "sessions": {} 
+    }
     try:
         chat = await bot.get_chat(CHANNEL_ID)
         if chat.pinned_message and chat.pinned_message.document:
@@ -48,14 +53,19 @@ def get_path_string(db, folder_id):
     return "🏠 /" + "/".join(reversed(path))
 
 async def render_browser(message, db, folder_id, user_id, edit_mode=False):
+    str_uid = str(user_id)
+    if db["sessions"].get(str_uid) != folder_id:
+        db["sessions"][str_uid] = folder_id
+        await save_db(db)
+
     contents = [f for f in db["files"] if f.get("parent_id", 0) == folder_id]
     contents.sort(key=lambda x: (x["type"] != 'folder', x["name"].lower()))
     
     path_str = get_path_string(db, folder_id)
     kb = []
 
-    if db["clipboard"].get(str(user_id)):
-        op = db["clipboard"][str(user_id)]['op']
+    if db["clipboard"].get(str_uid):
+        op = db["clipboard"][str_uid]['op']
         icon = "✂️" if op == 'move' else "📋"
         kb.append([InlineKeyboardButton(text=f"{icon} Paste Here", callback_data=f"paste_{folder_id}")])
 
@@ -75,7 +85,7 @@ async def render_browser(message, db, folder_id, user_id, edit_mode=False):
     ])
     
     markup = InlineKeyboardMarkup(inline_keyboard=kb)
-    text = f"📂 **Location:** `{path_str}`"
+    text = f"📂 **Location:** `{path_str}`\n__Drag & Drop files to upload here.__"
     
     if edit_mode:
         await message.edit_text(text, reply_markup=markup)
@@ -99,7 +109,6 @@ async def menu_open(message: types.Message):
 @dp.callback_query(F.data.startswith("mkd_"))
 async def ask_new_folder(cal: types.CallbackQuery):
     parent_id = cal.data.split("_")[1]
-    
     await cal.message.answer(
         f"📂 Name for new folder in location #{parent_id}?", 
         reply_markup=ForceReply(input_field_placeholder="Folder Name...")
@@ -110,7 +119,6 @@ async def ask_new_folder(cal: types.CallbackQuery):
 async def create_new_folder(message: types.Message):
     match = re.search(r"#(\d+)", message.reply_to_message.text)
     if not match: return
-    
     parent_id = int(match.group(1))
     folder_name = message.text
     
@@ -144,31 +152,37 @@ async def exec_rename(message: types.Message):
     new_name = message.text
     
     db = await get_db()
-    
+    pid = 0
     for f in db["files"]:
         if f["id"] == item_id:
             f["name"] = new_name
-            parent_id = f["parent_id"]
+            pid = f.get("parent_id", 0)
             break
             
     await save_db(db)
     await message.answer(f"✅ Renamed to `{new_name}`")
-    await render_browser(message, db, parent_id, message.from_user.id)
+    await render_browser(message, db, pid, message.from_user.id)
 
-@dp.message(F.document | F.photo | F.video)
+@dp.message(F.document | F.photo | F.video | F.audio)
 async def handle_upload(message: types.Message):
     status = await message.answer("⏳ Uploading...")
     
-    if message.document: fid, fname = message.document.file_id, message.document.file_name
+    if message.document: fid, fname = message.document.file_id, message.document.file_name or "Doc"
     elif message.photo: fid, fname = message.photo[-1].file_id, "Photo.jpg"
-    elif message.video: fid, fname = message.video.file_id, message.video.file_name
+    elif message.video: fid, fname = message.video.file_id, message.video.file_name or "Video.mp4"
+    elif message.audio: fid, fname = message.audio.file_id, message.audio.file_name or "Audio"
+    else: return
     
     backup = await bot.send_document(CHANNEL_ID, fid, caption=f"File: {fname}")
     
     db = await get_db()
+    
+    user_id = str(message.from_user.id)
+    current_folder = db.get("sessions", {}).get(user_id, 0)
+    
     db["files"].append({
         "id": db["next_id"], 
-        "parent_id": 0, 
+        "parent_id": current_folder, 
         "name": fname, 
         "type": "file", 
         "tg_id": fid, 
@@ -178,8 +192,9 @@ async def handle_upload(message: types.Message):
     await save_db(db)
     
     await status.delete()
-    await message.answer(f"✅ `{fname}` saved to Root.")
-    await render_browser(message, db, 0, message.from_user.id)
+    await message.answer(f"✅ `{fname}` saved.")
+    
+    await render_browser(message, db, current_folder, message.from_user.id)
 
 @dp.callback_query(F.data.startswith("nav_"))
 async def nav(c: types.CallbackQuery):
@@ -232,7 +247,7 @@ async def move_start(c: types.CallbackQuery):
     db = await get_db()
     db["clipboard"][str(c.from_user.id)] = {"op": "move", "id": iid}
     await save_db(db)
-    await c.answer("✂️ In Clipboard. Go to destination -> Paste.")
+    await c.answer("✂️ In Clipboard. Navigate to destination & Paste.")
 
 @dp.callback_query(F.data.startswith("paste_"))
 async def paste(c: types.CallbackQuery):
@@ -251,26 +266,25 @@ async def paste(c: types.CallbackQuery):
 
 @dp.callback_query(F.data == "search_ui")
 async def search_ask(c: types.CallbackQuery):
-    await c.message.answer("🔍 What are you looking for?", reply_markup=ForceReply())
+    await c.message.answer("🔍 Search query?", reply_markup=ForceReply())
     await c.answer()
 
-@dp.message(F.reply_to_message.text == "🔍 What are you looking for?")
+@dp.message(F.reply_to_message.text == "🔍 Search query?")
 async def search_exec(message: types.Message):
     query = message.text.lower()
     db = await get_db()
     res = [f for f in db["files"] if query in f["name"].lower()][:10]
-    
     kb = []
     for item in res:
         icon = "📁" if item["type"] == "folder" else "📄"
         cb = f"nav_{item['id']}" if item["type"] == "folder" else f"ctx_{item['id']}"
         kb.append([InlineKeyboardButton(text=f"{icon} {item['name']}", callback_data=cb)])
-        
     await message.answer(f"🔍 Results for `{query}`:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
 @app.post("/api/telegram")
 async def webhook(request: Request):
     try:
         await dp.feed_update(bot, Update(**await request.json()))
-    except: pass
+    except Exception as e:
+        print(f"Error: {e}")
     return {"status": "ok"}
