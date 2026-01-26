@@ -1,12 +1,12 @@
 import os
 import json
-import time
+import re
 from fastapi import FastAPI, Request
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command, CommandObject
+from aiogram.filters import Command
 from aiogram.types import (
     Update, BufferedInputFile, InlineKeyboardMarkup, 
-    InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
+    InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, ForceReply
 )
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -17,12 +17,7 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 async def get_db():
-    """Fetch DB. If empty, return strict schema."""
-    structure = {
-        "files": [],
-        "next_id": 1,
-        "clipboard": {}
-    }
+    structure = {"files": [], "next_id": 1, "clipboard": {}}
     try:
         chat = await bot.get_chat(CHANNEL_ID)
         if chat.pinned_message and chat.pinned_message.document:
@@ -54,33 +49,33 @@ def get_path_string(db, folder_id):
 
 async def render_browser(message, db, folder_id, user_id, edit_mode=False):
     contents = [f for f in db["files"] if f.get("parent_id", 0) == folder_id]
-    
     contents.sort(key=lambda x: (x["type"] != 'folder', x["name"].lower()))
     
     path_str = get_path_string(db, folder_id)
     kb = []
 
-    user_clip = db["clipboard"].get(str(user_id))
-    if user_clip:
-        op_icon = "✂️" if user_clip['op'] == 'move' else "📋"
-        kb.append([InlineKeyboardButton(text=f"{op_icon} Paste Here", callback_data=f"paste_{folder_id}")])
+    if db["clipboard"].get(str(user_id)):
+        op = db["clipboard"][str(user_id)]['op']
+        icon = "✂️" if op == 'move' else "📋"
+        kb.append([InlineKeyboardButton(text=f"{icon} Paste Here", callback_data=f"paste_{folder_id}")])
+
     if folder_id != 0:
-        curr_folder = next((f for f in db["files"] if f["id"] == folder_id), None)
-        parent = curr_folder["parent_id"] if curr_folder else 0
-        kb.append([InlineKeyboardButton(text="🔙 Go Up", callback_data=f"nav_{parent}")])
+        curr = next((f for f in db["files"] if f["id"] == folder_id), None)
+        pid = curr["parent_id"] if curr else 0
+        kb.append([InlineKeyboardButton(text="🔙 Go Up", callback_data=f"nav_{pid}")])
 
     for item in contents:
         icon = "📁" if item["type"] == "folder" else "📄"
         cb = f"nav_{item['id']}" if item["type"] == "folder" else f"ctx_{item['id']}"
         kb.append([InlineKeyboardButton(text=f"{icon} {item['name']}", callback_data=cb)])
-    tools = [
+
+    kb.append([
         InlineKeyboardButton(text="➕ New Folder", callback_data=f"mkd_{folder_id}"),
         InlineKeyboardButton(text="🔍 Search", callback_data="search_ui")
-    ]
-    kb.append(tools)
+    ])
     
     markup = InlineKeyboardMarkup(inline_keyboard=kb)
-    text = f"📂 **Location:** `{path_str}`\nItems: {len(contents)}"
+    text = f"📂 **Location:** `{path_str}`"
     
     if edit_mode:
         await message.edit_text(text, reply_markup=markup)
@@ -89,205 +84,193 @@ async def render_browser(message, db, folder_id, user_id, edit_mode=False):
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    await message.answer("👋 **Welcome to Ghost Explorer.**\nLoading Root...")
+    kb = [[KeyboardButton(text="📂 Open Drive"), KeyboardButton(text="❓ Help")]]
+    menu = ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True, persistent=True)
+    await message.answer("👻 **Ready.**", reply_markup=menu)
+    
     db = await get_db()
     await render_browser(message, db, 0, message.from_user.id)
 
-@dp.message(F.document | F.photo | F.video | F.audio)
-async def handle_upload(message: types.Message):
-    status = await message.answer("⏳ Uploading...")
-    
-    if message.document:
-        fid, fname = message.document.file_id, message.document.file_name or "Doc"
-    elif message.photo:
-        fid, fname = message.photo[-1].file_id, "Photo.jpg"
-    elif message.video:
-        fid, fname = message.video.file_id, message.video.file_name or "Video.mp4"
-    else:
-        return
-
-    backup = await bot.send_document(CHANNEL_ID, fid, caption=f"File: {fname}")
-    
+@dp.message(F.text == "📂 Open Drive")
+async def menu_open(message: types.Message):
     db = await get_db()
-    new_file = {
-        "id": db["next_id"],
-        "parent_id": 0,
-        "name": fname,
-        "type": "file",
-        "tg_id": fid,
-        "msg_id": backup.message_id
-    }
-    db["files"].append(new_file)
-    db["next_id"] += 1
-    await save_db(db)
-    
-    await status.delete()
-    await message.answer(f"✅ **{fname}** uploaded to Root.")
     await render_browser(message, db, 0, message.from_user.id)
-
-@dp.callback_query(F.data.startswith("nav_"))
-async def nav_folder(cal: types.CallbackQuery):
-    folder_id = int(cal.data.split("_")[1])
-    db = await get_db()
-    await render_browser(cal.message, db, folder_id, cal.from_user.id, edit_mode=True)
-    await cal.answer()
-
-@dp.callback_query(F.data.startswith("ctx_"))
-async def file_context(cal: types.CallbackQuery):
-    item_id = int(cal.data.split("_")[1])
-    db = await get_db()
-    item = next((x for x in db["files"] if x["id"] == item_id), None)
-    
-    if not item: return await cal.answer("Item not found.", show_alert=True)
-    
-    kb = [
-        [InlineKeyboardButton(text="⬇️ Download", callback_data=f"dl_{item_id}")],
-        [
-            InlineKeyboardButton(text="✏️ Rename", callback_data=f"ren_ask_{item_id}"),
-            InlineKeyboardButton(text="✂️ Move", callback_data=f"mv_start_{item_id}")
-        ],
-        [InlineKeyboardButton(text="🗑 Delete", callback_data=f"del_{item_id}")],
-        [InlineKeyboardButton(text="🔙 Back", callback_data=f"nav_{item.get('parent_id', 0)}")]
-    ]
-    
-    await cal.message.edit_text(
-        f"📄 **File:** `{item['name']}`\nSelect action:", 
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
-    )
-
-@dp.callback_query(F.data.startswith("dl_"))
-async def action_download(cal: types.CallbackQuery):
-    item_id = int(cal.data.split("_")[1])
-    db = await get_db()
-    item = next((x for x in db["files"] if x["id"] == item_id), None)
-    
-    if item:
-        await bot.copy_message(cal.from_user.id, CHANNEL_ID, item["msg_id"], caption=item["name"])
-        await cal.answer()
-    else:
-        await cal.answer("Error.", show_alert=True)
-
-@dp.callback_query(F.data.startswith("del_"))
-async def action_delete(cal: types.CallbackQuery):
-    item_id = int(cal.data.split("_")[1])
-    db = await get_db()
-    
-    def get_all_children(pid):
-        kids = [f["id"] for f in db["files"] if f.get("parent_id") == pid]
-        for k in kids: kids.extend(get_all_children(k))
-        return kids
-
-    to_delete = [item_id] + get_all_children(item_id)
-    
-    original_len = len(db["files"])
-    db["files"] = [f for f in db["files"] if f["id"] not in to_delete]
-    
-    if len(db["files"]) < original_len:
-        await save_db(db)
-        await cal.answer("🗑 Deleted.")
-        await render_browser(cal.message, db, 0, cal.from_user.id, edit_mode=True)
-    else:
-        await cal.answer("Delete failed.")
 
 @dp.callback_query(F.data.startswith("mkd_"))
-async def action_mkdir_start(cal: types.CallbackQuery):
-    parent = cal.data.split("_")[1]
-    await cal.message.answer(f"📂 Send me the name for the new folder.\n\nReply with: `/mkdir {parent} Name`")
+async def ask_new_folder(cal: types.CallbackQuery):
+    parent_id = cal.data.split("_")[1]
+    
+    await cal.message.answer(
+        f"📂 Name for new folder in location #{parent_id}?", 
+        reply_markup=ForceReply(input_field_placeholder="Folder Name...")
+    )
     await cal.answer()
 
-@dp.message(Command("mkdir"))
-async def action_mkdir_exec(message: types.Message, command: CommandObject):
-    args = command.args.split(" ", 1)
-    if len(args) < 2: return await message.answer("Usage: `/mkdir <id> <name>`")
+@dp.message(F.reply_to_message.text.contains("Name for new folder"))
+async def create_new_folder(message: types.Message):
+    match = re.search(r"#(\d+)", message.reply_to_message.text)
+    if not match: return
     
-    pid, name = int(args[0]), args[1]
+    parent_id = int(match.group(1))
+    folder_name = message.text
+    
     db = await get_db()
-    
     db["files"].append({
         "id": db["next_id"],
-        "parent_id": pid,
-        "name": name,
+        "parent_id": parent_id,
+        "name": folder_name,
         "type": "folder"
     })
     db["next_id"] += 1
     await save_db(db)
     
-    await message.answer(f"✅ Created folder `{name}`")
-    await render_browser(message, db, pid, message.from_user.id)
+    await message.answer(f"✅ Folder `{folder_name}` created.")
+    await render_browser(message, db, parent_id, message.from_user.id)
 
-@dp.callback_query(F.data.startswith("mv_start_"))
-async def action_move_start(cal: types.CallbackQuery):
-    item_id = int(cal.data.split("_")[1])
-    db = await get_db()
-    
-    db["clipboard"][str(cal.from_user.id)] = {"op": "move", "id": item_id}
-    await save_db(db)
-    
-    await cal.answer("✂️ Item in Clipboard. Go to destination and click Paste.")
-    item = next((x for x in db["files"] if x["id"] == item_id), None)
-    await render_browser(cal.message, db, item["parent_id"], cal.from_user.id, edit_mode=True)
-
-@dp.callback_query(F.data.startswith("paste_"))
-async def action_paste(cal: types.CallbackQuery):
-    dest_id = int(cal.data.split("_")[1])
-    db = await get_db()
-    clip = db["clipboard"].get(str(cal.from_user.id))
-    
-    if not clip: return await cal.answer("Clipboard empty.")
-    
-    item_idx = next((i for i, x in enumerate(db["files"]) if x["id"] == clip["id"]), None)
-    
-    if item_idx is not None:
-        if clip["op"] == "move":
-            db["files"][item_idx]["parent_id"] = dest_id
-            del db["clipboard"][str(cal.from_user.id)]
-            await save_db(db)
-            await cal.answer("✅ Moved.")
-            await render_browser(cal.message, db, dest_id, cal.from_user.id, edit_mode=True)
-    else:
-        await cal.answer("Item gone.")
-
-@dp.callback_query(F.data == "search_ui")
-async def action_search_ui(cal: types.CallbackQuery):
-    await cal.message.answer("🔍 Type `/search name` or `/filter pdf`")
+@dp.callback_query(F.data.startswith("ren_ask_"))
+async def ask_rename(cal: types.CallbackQuery):
+    item_id = cal.data.split("_")[1]
+    await cal.message.answer(
+        f"✏️ Enter new name for item #{item_id}:",
+        reply_markup=ForceReply(input_field_placeholder="New Name...")
+    )
     await cal.answer()
 
-@dp.message(Command("search"))
-async def cmd_search(message: types.Message, command: CommandObject):
-    if not command.args: return
-    query = command.args.lower()
+@dp.message(F.reply_to_message.text.contains("Enter new name for item"))
+async def exec_rename(message: types.Message):
+    match = re.search(r"#(\d+)", message.reply_to_message.text)
+    if not match: return
+    item_id = int(match.group(1))
+    new_name = message.text
+    
     db = await get_db()
     
-    results = [f for f in db["files"] if query in f["name"].lower()]
+    for f in db["files"]:
+        if f["id"] == item_id:
+            f["name"] = new_name
+            parent_id = f["parent_id"]
+            break
+            
+    await save_db(db)
+    await message.answer(f"✅ Renamed to `{new_name}`")
+    await render_browser(message, db, parent_id, message.from_user.id)
+
+@dp.message(F.document | F.photo | F.video)
+async def handle_upload(message: types.Message):
+    status = await message.answer("⏳ Uploading...")
+    
+    if message.document: fid, fname = message.document.file_id, message.document.file_name
+    elif message.photo: fid, fname = message.photo[-1].file_id, "Photo.jpg"
+    elif message.video: fid, fname = message.video.file_id, message.video.file_name
+    
+    backup = await bot.send_document(CHANNEL_ID, fid, caption=f"File: {fname}")
+    
+    db = await get_db()
+    db["files"].append({
+        "id": db["next_id"], 
+        "parent_id": 0, 
+        "name": fname, 
+        "type": "file", 
+        "tg_id": fid, 
+        "msg_id": backup.message_id
+    })
+    db["next_id"] += 1
+    await save_db(db)
+    
+    await status.delete()
+    await message.answer(f"✅ `{fname}` saved to Root.")
+    await render_browser(message, db, 0, message.from_user.id)
+
+@dp.callback_query(F.data.startswith("nav_"))
+async def nav(c: types.CallbackQuery):
+    fid = int(c.data.split("_")[1])
+    db = await get_db()
+    await render_browser(c.message, db, fid, c.from_user.id, edit_mode=True)
+    await c.answer()
+
+@dp.callback_query(F.data.startswith("ctx_"))
+async def ctx(c: types.CallbackQuery):
+    iid = int(c.data.split("_")[1])
+    db = await get_db()
+    item = next((x for x in db["files"] if x["id"] == iid), None)
+    if not item: return await c.answer("Missing.")
+    
+    kb = [
+        [InlineKeyboardButton(text="⬇️ Download", callback_data=f"dl_{iid}")],
+        [InlineKeyboardButton(text="✏️ Rename", callback_data=f"ren_ask_{iid}"),
+         InlineKeyboardButton(text="✂️ Move", callback_data=f"mv_{iid}")],
+        [InlineKeyboardButton(text="🗑 Delete", callback_data=f"del_{iid}")],
+        [InlineKeyboardButton(text="🔙 Back", callback_data=f"nav_{item.get('parent_id',0)}")]
+    ]
+    await c.message.edit_text(f"📄 `{item['name']}`", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+@dp.callback_query(F.data.startswith("dl_"))
+async def dl(c: types.CallbackQuery):
+    iid = int(c.data.split("_")[1])
+    db = await get_db()
+    item = next((x for x in db["files"] if x["id"] == iid), None)
+    if item: await bot.copy_message(c.from_user.id, CHANNEL_ID, item["msg_id"])
+    await c.answer()
+
+@dp.callback_query(F.data.startswith("del_"))
+async def delete(c: types.CallbackQuery):
+    iid = int(c.data.split("_")[1])
+    db = await get_db()
+    def get_kids(pid):
+        kids = [f["id"] for f in db["files"] if f.get("parent_id")==pid]
+        for k in kids: kids.extend(get_kids(k))
+        return kids
+    to_del = [iid] + get_kids(iid)
+    db["files"] = [f for f in db["files"] if f["id"] not in to_del]
+    await save_db(db)
+    await c.answer("Deleted.")
+    await render_browser(c.message, db, 0, c.from_user.id, edit_mode=True)
+
+@dp.callback_query(F.data.startswith("mv_"))
+async def move_start(c: types.CallbackQuery):
+    iid = int(c.data.split("_")[1])
+    db = await get_db()
+    db["clipboard"][str(c.from_user.id)] = {"op": "move", "id": iid}
+    await save_db(db)
+    await c.answer("✂️ In Clipboard. Go to destination -> Paste.")
+
+@dp.callback_query(F.data.startswith("paste_"))
+async def paste(c: types.CallbackQuery):
+    dest = int(c.data.split("_")[1])
+    db = await get_db()
+    clip = db["clipboard"].get(str(c.from_user.id))
+    if clip:
+        for f in db["files"]:
+            if f["id"] == clip["id"]:
+                f["parent_id"] = dest
+                break
+        del db["clipboard"][str(c.from_user.id)]
+        await save_db(db)
+        await c.answer("Moved.")
+        await render_browser(c.message, db, dest, c.from_user.id, edit_mode=True)
+
+@dp.callback_query(F.data == "search_ui")
+async def search_ask(c: types.CallbackQuery):
+    await c.message.answer("🔍 What are you looking for?", reply_markup=ForceReply())
+    await c.answer()
+
+@dp.message(F.reply_to_message.text == "🔍 What are you looking for?")
+async def search_exec(message: types.Message):
+    query = message.text.lower()
+    db = await get_db()
+    res = [f for f in db["files"] if query in f["name"].lower()][:10]
     
     kb = []
-    for item in results[:10]:
+    for item in res:
         icon = "📁" if item["type"] == "folder" else "📄"
         cb = f"nav_{item['id']}" if item["type"] == "folder" else f"ctx_{item['id']}"
         kb.append([InlineKeyboardButton(text=f"{icon} {item['name']}", callback_data=cb)])
         
     await message.answer(f"🔍 Results for `{query}`:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
-@dp.message(Command("filter"))
-async def cmd_filter(message: types.Message, command: CommandObject):
-    if not command.args: return
-    ext = command.args.lower()
-    db = await get_db()
-    
-    results = [f for f in db["files"] if f["name"].lower().endswith(ext)]
-    
-    kb = []
-    for item in results[:10]:
-        kb.append([InlineKeyboardButton(text=f"📄 {item['name']}", callback_data=f"ctx_{item['id']}")])
-        
-    await message.answer(f"🔍 Filter `.{ext}`:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
-
 @app.post("/api/telegram")
-async def telegram_webhook(request: Request):
+async def webhook(request: Request):
     try:
-        data = await request.json()
-        update = Update(**data)
-        await dp.feed_update(bot, update)
-    except Exception as e:
-        print(f"Error: {e}")
+        await dp.feed_update(bot, Update(**await request.json()))
+    except: pass
     return {"status": "ok"}
