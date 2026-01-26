@@ -90,6 +90,7 @@ async def btn_usage(message: types.Message):
 async def btn_my_files(message: types.Message):
     """
     Lists files using Inline Buttons (Type 2).
+    Includes error handling for corrupted DB entries.
     """
     db = await get_db()
     files = db.get("files", [])
@@ -97,7 +98,11 @@ async def btn_my_files(message: types.Message):
     if not files:
         return await message.answer("📂 Drive is empty. Upload a file first!")
 
-    recent_files = sorted(files, key=lambda x: x['id'], reverse=True)[:10]
+    valid_files = [f for f in files if isinstance(f, dict) and 'id' in f and 'name' in f]
+    
+    if not valid_files:
+        return await message.answer("⚠️ Files exist but appear corrupted. Try uploading a new file.")
+    recent_files = sorted(valid_files, key=lambda x: x['id'], reverse=True)[:10]
 
     keyboard = []
     for f in recent_files:
