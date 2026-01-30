@@ -2,6 +2,7 @@ import os
 import json
 import re
 import asyncio
+import redis.asyncio as redis
 from fastapi import FastAPI, Request
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -12,10 +13,12 @@ from aiogram.types import (
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHANNEL_ID = os.environ.get("CHANNEL_ID")
+KV_URL = os.environ.get("KV_URL") or os.environ.get("REDIS_URL")
 
 app = FastAPI()
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+r = redis.from_url(KV_URL)
 
 async def get_db():
     structure = {
@@ -24,8 +27,17 @@ async def get_db():
         "clipboard": {}, 
         "sessions": {},
         "ui_state": {},
-        "pending_ops": {} # u_id -> {type: 'upload/paste', data: ...}
+        "pending_ops": {} 
     }
+    
+    # Try Redis First
+    try:
+        raw = await r.get("cl4nk_db")
+        if raw: return json.loads(raw)
+    except: pass
+
+    # Fallback: Migration from Telegram
+    print("MIGRATION: Fetching from Telegram...")
     try:
         chat = await bot.get_chat(CHANNEL_ID)
         if chat.pinned_message and chat.pinned_message.document:
@@ -33,37 +45,22 @@ async def get_db():
             data = json.load(f)
             for k, v in structure.items():
                 if k not in data: data[k] = v
+            
+            # Save to Redis immediately
+            await r.set("cl4nk_db", json.dumps(data))
             return data
-    except:
-        pass
+    except Exception as e:
+        print(f"Migration Failed: {e}")
     return structure
 
 async def save_db(db_data):
     try:
-        json_bytes = json.dumps(db_data).encode('utf-8')
-        input_file = BufferedInputFile(json_bytes, filename="system.json")
-        
-        # Try to update existing pinned message to save calls
-        try:
-            chat = await bot.get_chat(CHANNEL_ID)
-            if chat.pinned_message:
-                await bot.edit_message_media(
-                    media=types.InputMediaDocument(media=input_file, caption="[DB_SYSTEM]"),
-                    chat_id=CHANNEL_ID,
-                    message_id=chat.pinned_message.message_id
-                )
-                return True
-        except Exception:
-            pass # Fallback to sending new message
-            
-        # Fallback
-        msg = await bot.send_document(CHANNEL_ID, input_file, caption="[DB_SYSTEM]")
-        try: await bot.pin_chat_message(CHANNEL_ID, msg.message_id, disable_notification=True)
-        except: pass
+        await r.set("cl4nk_db", json.dumps(db_data))
         return True
     except Exception as e:
-        print(f"SaveDB Error: {e}")
+        print(f"Redis Save Error: {e}")
         return False
+
 
 def check_collision(db, folder_id, name, exclude_id=None):
     for f in db["files"]:
