@@ -42,6 +42,21 @@ async def save_db(db_data):
     try:
         json_bytes = json.dumps(db_data).encode('utf-8')
         input_file = BufferedInputFile(json_bytes, filename="system.json")
+        
+        # Try to update existing pinned message to save calls
+        try:
+            chat = await bot.get_chat(CHANNEL_ID)
+            if chat.pinned_message:
+                await bot.edit_message_media(
+                    media=types.InputMediaDocument(media=input_file, caption="[DB_SYSTEM]"),
+                    chat_id=CHANNEL_ID,
+                    message_id=chat.pinned_message.message_id
+                )
+                return True
+        except Exception:
+            pass # Fallback to sending new message
+            
+        # Fallback
         msg = await bot.send_document(CHANNEL_ID, input_file, caption="[DB_SYSTEM]")
         try: await bot.pin_chat_message(CHANNEL_ID, msg.message_id, disable_notification=True)
         except: pass
