@@ -160,7 +160,6 @@ async def render_browser(user_id, db, folder_id, message_to_edit=None):
 
     kb.append([
         InlineKeyboardButton(text="➕ New Folder", callback_data=f"mkd_{folder_id}"),
-        InlineKeyboardButton(text="➕ New Folder", callback_data=f"mkd_{folder_id}"),
         InlineKeyboardButton(text="🔍 Search", callback_data="search_ui"),
         InlineKeyboardButton(text="🔃 Sort", callback_data="sort_ui")
     ])
@@ -685,6 +684,21 @@ async def close_search(c: types.CallbackQuery):
 @app.post("/api/telegram")
 async def webhook(request: Request):
     try: 
+        # Version Check
+        curr_ver = os.environ.get("VERCEL_GIT_COMMIT_SHA")
+        if curr_ver:
+            last_ver = await r.get("app_version")
+            if hasattr(last_ver, 'decode'): last_ver = last_ver.decode('utf-8')
+            
+            if last_ver != curr_ver:
+                await r.set("app_version", curr_ver)
+                db = await get_db()
+                for uid in db["sessions"]:
+                    try:
+                         await bot.send_message(uid, "🚀 **Update Detected!** Refreshing...", disable_notification=True)
+                         await render_browser(uid, db, db["sessions"][uid])
+                    except: pass
+
         await dp.feed_update(bot, Update(**await request.json()))
     except Exception as e:
         print(f"WEBHOOK ERROR: {e}")
