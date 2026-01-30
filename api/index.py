@@ -135,13 +135,20 @@ async def render_browser(user_id, db, folder_id, message_to_edit=None):
         db["ui_state"][str_uid] = new_msg.message_id
         await save_db(db)
 
+def get_main_menu():
+    kb = [[KeyboardButton(text="📂 Open Drive"), KeyboardButton(text="❓ Help")]]
+    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True, persistent=True)
+
+async def restore_menu(message: types.Message):
+    try:
+        tmp = await message.answer("..", reply_markup=get_main_menu())
+        await tmp.delete()
+    except: pass
+
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await delete_user_message(message)
-    kb = [[KeyboardButton(text="📂 Open Drive"), KeyboardButton(text="❓ Help")]]
-    menu = ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True, persistent=True)
-    
-    tmp = await message.answer("👻 Starting...", reply_markup=menu)
+    tmp = await message.answer("👻 Starting...", reply_markup=get_main_menu())
     await asyncio.sleep(0.5)
     await tmp.delete()
 
@@ -190,6 +197,7 @@ async def ask_new_folder(cal: types.CallbackQuery):
 @dp.message(F.reply_to_message.text.contains("Name for new folder"))
 async def create_new_folder(message: types.Message):
     await delete_user_message(message)
+    await restore_menu(message)
     try: await bot.delete_message(message.chat.id, message.reply_to_message.message_id)
     except: pass
 
@@ -225,6 +233,7 @@ async def ask_rename(cal: types.CallbackQuery):
 @dp.message(F.reply_to_message.text.contains("New name for item"))
 async def exec_rename(message: types.Message):
     await delete_user_message(message)
+    await restore_menu(message)
     try: await bot.delete_message(message.chat.id, message.reply_to_message.message_id)
     except: pass
 
@@ -392,6 +401,7 @@ async def resolve_col(c: types.CallbackQuery):
 @dp.message(F.reply_to_message.text.contains("Enter new name for"))
 async def resolve_rename_input(message: types.Message):
     await delete_user_message(message)
+    await restore_menu(message)
     try: await bot.delete_message(message.chat.id, message.reply_to_message.message_id)
     except: pass
     
@@ -558,6 +568,7 @@ async def search_ask(c: types.CallbackQuery):
 @dp.message(F.reply_to_message.text == "🔍 Query?")
 async def search_exec(message: types.Message):
     await delete_user_message(message)
+    await restore_menu(message)
     try: await bot.delete_message(message.chat.id, message.reply_to_message.message_id)
     except: pass
 
