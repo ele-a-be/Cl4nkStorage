@@ -172,16 +172,23 @@ async def create_new_folder(message: types.Message):
     try: await bot.delete_message(message.chat.id, message.reply_to_message.message_id)
     except: pass
 
-    match = re.search(r"#(\d+)", message.reply_to_message.text)
-    if not match: return
-    pid, name = int(match.group(1)), message.text
-    
-    db = await get_db()
-    db["files"].append({"id": db["next_id"], "parent_id": pid, "name": name, "type": "folder"})
-    db["next_id"] += 1
-    await save_db(db)
-    
-    await render_browser(message.from_user.id, db, pid)
+    try:
+        match = re.search(r"#(\d+)", message.reply_to_message.text)
+        if not match: 
+            return await message.answer("❌ Error: Could not determine parent folder.")
+        
+        pid, name = int(match.group(1)), message.text.strip()
+        if not name:
+             return await message.answer("❌ Error: Folder name cannot be empty.")
+
+        db = await get_db()
+        db["files"].append({"id": db["next_id"], "parent_id": pid, "name": name, "type": "folder"})
+        db["next_id"] += 1
+        await save_db(db)
+        
+        await render_browser(message.from_user.id, db, pid)
+    except Exception as e:
+        await message.answer(f"❌ System Error: {str(e)}")
 
 @dp.callback_query(F.data.startswith("ren_ask_"))
 async def ask_rename(cal: types.CallbackQuery):
@@ -195,23 +202,28 @@ async def exec_rename(message: types.Message):
     try: await bot.delete_message(message.chat.id, message.reply_to_message.message_id)
     except: pass
 
-    match = re.search(r"#(\d+)", message.reply_to_message.text)
-    if not match: return
-    iid, new_name = int(match.group(1)), message.text
-    
-    db = await get_db()
-    pid = 0
-    found = False
-    for f in db["files"]:
-        if f["id"] == iid:
-            f["name"] = new_name
-            pid = f.get("parent_id", 0)
-            found = True
-            break
+    try:
+        match = re.search(r"#(\d+)", message.reply_to_message.text)
+        if not match: 
+            return await message.answer("❌ Error: Could not parse item ID from message.")
             
-    if found:
-        await save_db(db)
-        await render_browser(message.from_user.id, db, pid)
+        iid, new_name = int(match.group(1)), message.text.strip()
+        if not new_name:
+             return await message.answer("❌ Error: Name cannot be empty.")
+
+        db = await get_db()
+        target = next((f for f in db["files"] if f["id"] == iid), None)
+        
+        if target:
+            target["name"] = new_name
+            await save_db(db) # Save first to ensure persistence
+            pid = target.get("parent_id", 0)
+            await render_browser(message.from_user.id, db, pid)
+        else:
+            await message.answer("❌ Error: Item not found/missing.")
+
+    except Exception as e:
+        await message.answer(f"❌ System Error: {str(e)}")
 
 @dp.message(F.document | F.photo | F.video)
 async def handle_upload(message: types.Message):
