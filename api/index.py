@@ -27,6 +27,7 @@ async def get_db():
         "clipboard": {}, 
         "sessions": {},
         "ui_state": {},
+        "sort_prefs": {},
         "pending_ops": {} 
     }
     
@@ -108,7 +109,32 @@ async def render_browser(user_id, db, folder_id, message_to_edit=None):
         await save_db(db)
 
     contents = [f for f in db["files"] if f.get("parent_id", 0) == folder_id]
-    contents.sort(key=lambda x: (x["type"] != 'folder', x["name"].lower()))
+    contents = [f for f in db["files"] if f.get("parent_id", 0) == folder_id]
+    
+    # Sorting
+    pref = db["sort_prefs"].get(str_uid, {'field': 'name', 'order': 'asc'})
+    field = pref['field']
+    reverse = (pref['order'] == 'desc')
+    
+    def sort_key(x):
+        if field == 'name': return x["name"].lower()
+        if field == 'date': return x.get("date", 0)
+        if field == 'size': return x.get("size", 0)
+        if field == 'type': return x["type"]
+        return x["name"].lower()
+    
+    contents.sort(key=lambda x: (x["type"] != 'folder', sort_key(x)), reverse=reverse if field != 'name' else False)
+
+    folders = [x for x in contents if x["type"] == "folder"]
+    files = [x for x in contents if x["type"] != "file"] # wait, type is 'file' or 'folder'
+    # Actually just re-filter
+    folders = [x for x in contents if x["type"] == "folder"]
+    files_only = [x for x in contents if x["type"] == "file"]
+    
+    folders.sort(key=sort_key, reverse=reverse)
+    files_only.sort(key=sort_key, reverse=reverse)
+    
+    contents = folders + files_only
     
     path_str = get_path_string(db, folder_id)
     kb = []
@@ -130,7 +156,9 @@ async def render_browser(user_id, db, folder_id, message_to_edit=None):
 
     kb.append([
         InlineKeyboardButton(text="➕ New Folder", callback_data=f"mkd_{folder_id}"),
-        InlineKeyboardButton(text="🔍 Search", callback_data="search_ui")
+        InlineKeyboardButton(text="➕ New Folder", callback_data=f"mkd_{folder_id}"),
+        InlineKeyboardButton(text="🔍 Search", callback_data="search_ui"),
+        InlineKeyboardButton(text="🔃 Sort", callback_data="sort_ui")
     ])
     
     markup = InlineKeyboardMarkup(inline_keyboard=kb)
@@ -280,9 +308,16 @@ async def exec_rename(message: types.Message):
 
 @dp.message(F.document | F.photo | F.video)
 async def handle_upload(message: types.Message):
-    if message.document: fid, fname = message.document.file_id, message.document.file_name or "Doc"
-    elif message.photo: fid, fname = message.photo[-1].file_id, "Photo.jpg"
-    elif message.video: fid, fname = message.video.file_id, message.video.file_name or "Video.mp4"
+    fsize = 0
+    if message.document: 
+        fid, fname = message.document.file_id, message.document.file_name or "Doc"
+        fsize = message.document.file_size or 0
+    elif message.photo: 
+        fid, fname = message.photo[-1].file_id, "Photo.jpg"
+        fsize = message.photo[-1].file_size or 0
+    elif message.video: 
+        fid, fname = message.video.file_id, message.video.file_name or "Video.mp4"
+        fsize = message.video.file_size or 0
     else: return
     
     status = await message.answer("⏳ Processing...")
@@ -296,7 +331,7 @@ async def handle_upload(message: types.Message):
         # Save pending state
         db["pending_ops"][uid] = {
             "type": "upload",
-            "data": {"fid": fid, "fname": fname, "pid": curr}
+            "data": {"fid": fid, "fname": fname, "pid": curr, "size": fsize, "date": int(message.date.timestamp())}
         }
         await save_db(db)
         
@@ -316,7 +351,8 @@ async def handle_upload(message: types.Message):
     backup = await bot.send_document(CHANNEL_ID, fid, caption=f"File: {fname}")
     db["files"].append({
         "id": db["next_id"], "parent_id": curr, "name": fname, 
-        "type": "file", "tg_id": fid, "msg_id": backup.message_id
+        "type": "file", "tg_id": fid, "msg_id": backup.message_id,
+        "size": fsize, "date": int(message.date.timestamp())
     })
     db["next_id"] += 1
     await save_db(db)
@@ -594,6 +630,49 @@ async def search_exec(message: types.Message):
     
     kb.append([InlineKeyboardButton(text="❌ Close Results", callback_data="close_search")])
     await message.answer(f"🔍 Results for `{q}`:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+@dp.callback_query(F.data == "sort_ui")
+async def sort_ui(c: types.CallbackQuery):
+    db = await get_db()
+    uid = str(c.from_user.id)
+    pref = db["sort_prefs"].get(uid, {'field': 'name', 'order': 'asc'})
+    
+    text = f"🔃 **Sort Options**\nCurrent: **{pref['field'].title()}** ({pref['order'].upper()})"
+    
+    kb = [
+        [
+            InlineKeyboardButton(text="🔤 Name", callback_data="sort_set_name"),
+            InlineKeyboardButton(text="📅 Date", callback_data="sort_set_date"),
+        ],
+        [
+            InlineKeyboardButton(text="⚖️ Size", callback_data="sort_set_size"),
+            InlineKeyboardButton(text="📑 Type", callback_data="sort_set_type"),
+        ],
+        [
+            InlineKeyboardButton(text="⬆️ Asc", callback_data="sort_set_asc"),
+            InlineKeyboardButton(text="⬇️ Desc", callback_data="sort_set_desc"),
+        ],
+        [InlineKeyboardButton(text="🔙 Back", callback_data=f"nav_{db['sessions'].get(uid, 0)}")]
+    ]
+    await c.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await c.answer()
+
+@dp.callback_query(F.data.startswith("sort_set_"))
+async def sort_set(c: types.CallbackQuery):
+    action = c.data.split("_")[2] # name, date, size, type, asc, desc
+    db = await get_db()
+    uid = str(c.from_user.id)
+    
+    if uid not in db["sort_prefs"]: db["sort_prefs"][uid] = {'field': 'name', 'order': 'asc'}
+    pref = db["sort_prefs"][uid]
+    
+    if action in ['asc', 'desc']:
+        pref['order'] = action
+    else:
+        pref['field'] = action
+        
+    await save_db(db)
+    await sort_ui(c) 
 
 @dp.callback_query(F.data == "close_search")
 async def close_search(c: types.CallbackQuery):
