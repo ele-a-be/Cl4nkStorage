@@ -34,7 +34,11 @@ async def get_db():
     # Try Redis First
     try:
         raw = await r.get("cl4nk_db")
-        if raw: return json.loads(raw)
+        if raw: 
+            data = json.loads(raw)
+            for k, v in structure.items():
+                if k not in data: data[k] = v
+            return data
     except: pass
 
     # Fallback: Migration from Telegram
