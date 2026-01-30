@@ -350,7 +350,8 @@ async def resolve_col(c: types.CallbackQuery):
                 recursive_copy(src, pdata["dest_id"])
             
         elif action == "ren":
-             await c.message.edit_text(f"✏️ Enter new name for **{src['name']}**:", reply_markup=ForceReply())
+             await c.message.delete()
+             await c.message.answer(f"✏️ Enter new name for **{src['name']}**:", reply_markup=ForceReply())
              pending["type"] = "paste_rename"
              await save_db(db)
              return await c.answer()
@@ -382,7 +383,8 @@ async def resolve_col(c: types.CallbackQuery):
             await render_browser(c.from_user.id, db, pdata["pid"])
             
         elif action == "ren":
-            await c.message.edit_text(f"✏️ Enter new name for **{pdata['fname']}**:", reply_markup=ForceReply())
+            await c.message.delete()
+            await c.message.answer(f"✏️ Enter new name for **{pdata['fname']}**:", reply_markup=ForceReply())
             pending["type"] = "upload_rename"
             await save_db(db)
             return await c.answer()
