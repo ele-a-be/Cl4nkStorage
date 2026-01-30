@@ -205,7 +205,7 @@ async def exec_rename(message: types.Message):
     try:
         match = re.search(r"#(\d+)", message.reply_to_message.text)
         if not match: 
-            return await message.answer("❌ Error: Could not parse item ID from message.")
+            return await message.answer(f"❌ Error: Could not parse item ID from message.\nContent: '{message.reply_to_message.text}'")
             
         iid, new_name = int(match.group(1)), message.text.strip()
         if not new_name:
