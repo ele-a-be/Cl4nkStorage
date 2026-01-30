@@ -23,7 +23,8 @@ async def get_db():
         "next_id": 1, 
         "clipboard": {}, 
         "sessions": {},
-        "ui_state": {} 
+        "ui_state": {},
+        "pending_ops": {} # u_id -> {type: 'upload/paste', data: ...}
     }
     try:
         chat = await bot.get_chat(CHANNEL_ID)
@@ -38,10 +39,23 @@ async def get_db():
     return structure
 
 async def save_db(db_data):
-    json_bytes = json.dumps(db_data).encode('utf-8')
-    input_file = BufferedInputFile(json_bytes, filename="system.json")
-    msg = await bot.send_document(CHANNEL_ID, input_file, caption="[DB_SYSTEM]")
-    await bot.pin_chat_message(CHANNEL_ID, msg.message_id, disable_notification=True)
+    try:
+        json_bytes = json.dumps(db_data).encode('utf-8')
+        input_file = BufferedInputFile(json_bytes, filename="system.json")
+        msg = await bot.send_document(CHANNEL_ID, input_file, caption="[DB_SYSTEM]")
+        try: await bot.pin_chat_message(CHANNEL_ID, msg.message_id, disable_notification=True)
+        except: pass
+        return True
+    except Exception as e:
+        print(f"SaveDB Error: {e}")
+        return False
+
+def check_collision(db, folder_id, name, exclude_id=None):
+    for f in db["files"]:
+        if f.get("parent_id", 0) == folder_id and f["name"] == name:
+            if exclude_id and f["id"] == exclude_id: continue
+            return f
+    return None
 
 async def delete_previous_dashboard(user_id, db):
     last_msg_id = db["ui_state"].get(str(user_id))
@@ -215,10 +229,16 @@ async def exec_rename(message: types.Message):
         target = next((f for f in db["files"] if f["id"] == iid), None)
         
         if target:
-            target["name"] = new_name
-            await save_db(db) # Save first to ensure persistence
+            # Check Collision
             pid = target.get("parent_id", 0)
-            await render_browser(message.from_user.id, db, pid)
+            if check_collision(db, pid, new_name, exclude_id=iid):
+                return await message.answer(f"❌ Error: A file named '{new_name}' already exists in this folder.")
+
+            target["name"] = new_name
+            if await save_db(db):
+                await render_browser(message.from_user.id, db, pid)
+            else:
+                await message.answer("⚠️ Warning: Database save failed (Rate Limit?). Changes might not persist.")
         else:
             await message.answer("❌ Error: Item not found/missing.")
 
@@ -232,14 +252,35 @@ async def handle_upload(message: types.Message):
     elif message.video: fid, fname = message.video.file_id, message.video.file_name or "Video.mp4"
     else: return
     
-    status = await message.answer("⏳ Uploading...")
-    
-    backup = await bot.send_document(CHANNEL_ID, fid, caption=f"File: {fname}")
+    status = await message.answer("⏳ Processing...")
     
     db = await get_db()
     uid = str(message.from_user.id)
     curr = db.get("sessions", {}).get(uid, 0)
     
+    collision = check_collision(db, curr, fname)
+    if collision:
+        # Save pending state
+        db["pending_ops"][uid] = {
+            "type": "upload",
+            "data": {"fid": fid, "fname": fname, "pid": curr}
+        }
+        await save_db(db)
+        
+        await message.answer(
+            f"⚠️ File **{fname}** already exists.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔁 Overwrite", callback_data="col_over")],
+                [InlineKeyboardButton(text="✏️ Rename New", callback_data="col_ren")],
+                [InlineKeyboardButton(text="❌ Cancel", callback_data="col_cancel")]
+            ])
+        )
+        await delete_user_message(message)
+        await status.delete()
+        return
+
+    # No collision, proceed normally
+    backup = await bot.send_document(CHANNEL_ID, fid, caption=f"File: {fname}")
     db["files"].append({
         "id": db["next_id"], "parent_id": curr, "name": fname, 
         "type": "file", "tg_id": fid, "msg_id": backup.message_id
@@ -251,6 +292,147 @@ async def handle_upload(message: types.Message):
     await status.delete()              
     
     await render_browser(message.from_user.id, db, curr)
+
+@dp.callback_query(F.data.startswith("col_"))
+async def resolve_col(c: types.CallbackQuery):
+    action = c.data.split("_")[1]
+    db = await get_db()
+    uid = str(c.from_user.id)
+    pending = db["pending_ops"].get(uid)
+    
+    if not pending: 
+        return await c.answer("Expired or invalid.")
+    
+    if action == "cancel":
+        del db["pending_ops"][uid]
+        await save_db(db)
+        await c.message.delete()
+        return await c.answer("Cancelled.")
+
+    # Helper for paste/move logic
+    def recursive_copy(item, new_parent, rename_to=None):
+        new_entry = item.copy()
+        new_entry["id"] = db["next_id"]
+        new_entry["parent_id"] = new_parent
+        if rename_to: new_entry["name"] = rename_to
+        db["files"].append(new_entry)
+        db["next_id"] += 1
+        if item["type"] == "folder":
+            children = [x for x in db["files"] if x.get("parent_id") == item["id"] and x["id"] != new_entry["id"]]
+            for child in children: recursive_copy(child, new_entry["id"])
+
+    if pending["type"] == "paste":
+        pdata = pending["data"]
+        src = next((x for x in db["files"] if x["id"] == pdata["src_id"]), None)
+        if not src: return await c.answer("Source item missing.")
+
+        if action == "over":
+            target = check_collision(db, pdata["dest_id"], src["name"], exclude_id=src["id"])
+            if target:
+                db["files"] = [f for f in db["files"] if f["id"] != target["id"]]
+            
+            if pdata["clip"]["op"] == "move":
+                src["parent_id"] = pdata["dest_id"]
+            else:
+                recursive_copy(src, pdata["dest_id"])
+            
+        elif action == "ren":
+             await c.message.edit_text(f"✏️ Enter new name for **{src['name']}**:", reply_markup=ForceReply())
+             pending["type"] = "paste_rename"
+             await save_db(db)
+             return await c.answer()
+
+        del db["pending_ops"][uid]
+        if uid in db["clipboard"]: del db["clipboard"][uid] # Clear clipboard on success
+        await save_db(db)
+        await c.message.delete()
+        await render_browser(c.from_user.id, db, pdata["dest_id"])
+
+    elif pending["type"] == "upload":
+        pdata = pending["data"]
+        
+        if action == "over":
+            target = check_collision(db, pdata["pid"], pdata["fname"])
+            if target:
+                db["files"] = [f for f in db["files"] if f["id"] != target["id"]]
+            
+            backup = await bot.send_document(CHANNEL_ID, pdata["fid"], caption=f"File: {pdata['fname']}")
+            db["files"].append({
+                "id": db["next_id"], "parent_id": pdata["pid"], "name": pdata["fname"], 
+                "type": "file", "tg_id": pdata["fid"], "msg_id": backup.message_id
+            })
+            db["next_id"] += 1
+            
+            del db["pending_ops"][uid]
+            await save_db(db)
+            await c.message.delete()
+            await render_browser(c.from_user.id, db, pdata["pid"])
+            
+        elif action == "ren":
+            await c.message.edit_text(f"✏️ Enter new name for **{pdata['fname']}**:", reply_markup=ForceReply())
+            pending["type"] = "upload_rename"
+            await save_db(db)
+            return await c.answer()
+
+@dp.message(F.reply_to_message.text.contains("Enter new name for"))
+async def resolve_rename_input(message: types.Message):
+    await delete_user_message(message)
+    try: await bot.delete_message(message.chat.id, message.reply_to_message.message_id)
+    except: pass
+    
+    new_name = message.text.strip()
+    if not new_name: return await message.answer("Invalid name.")
+
+    db = await get_db()
+    uid = str(message.from_user.id)
+    pending = db["pending_ops"].get(uid)
+    
+    if not pending: return
+    
+    # Helper for paste/move logic (duplicated because scope)
+    def recursive_copy(item, new_parent, rename_to=None):
+        new_entry = item.copy()
+        new_entry["id"] = db["next_id"]
+        new_entry["parent_id"] = new_parent
+        if rename_to: new_entry["name"] = rename_to
+        db["files"].append(new_entry)
+        db["next_id"] += 1
+        if item["type"] == "folder":
+            children = [x for x in db["files"] if x.get("parent_id") == item["id"] and x["id"] != new_entry["id"]]
+            for child in children: recursive_copy(child, new_entry["id"])
+
+    if pending["type"] == "upload_rename":
+        pdata = pending["data"]
+        if check_collision(db, pdata["pid"], new_name):
+            return await message.answer("❌ That name is also taken! Try again.")
+            
+        backup = await bot.send_document(CHANNEL_ID, pdata["fid"], caption=f"File: {new_name}")
+        db["files"].append({
+            "id": db["next_id"], "parent_id": pdata["pid"], "name": new_name, 
+            "type": "file", "tg_id": pdata["fid"], "msg_id": backup.message_id
+        })
+        db["next_id"] += 1
+        await render_browser(message.from_user.id, db, pdata["pid"])
+
+    elif pending["type"] == "paste_rename":
+        pdata = pending["data"]
+        src = next((x for x in db["files"] if x["id"] == pdata["src_id"]), None)
+        if not src: return await message.answer("Source item missing.")
+        
+        if check_collision(db, pdata["dest_id"], new_name, exclude_id=src["id"]):
+            return await message.answer("❌ That name is also taken! Try again.")
+            
+        if pdata["clip"]["op"] == "move":
+             src["name"] = new_name
+             src["parent_id"] = pdata["dest_id"]
+        else:
+             recursive_copy(src, pdata["dest_id"], rename_to=new_name)
+             
+        if uid in db["clipboard"]: del db["clipboard"][uid]
+        await render_browser(message.from_user.id, db, pdata["dest_id"])
+
+    del db["pending_ops"][uid]
+    await save_db(db)
 
 @dp.callback_query(F.data.startswith("cp_"))
 async def clipboard_action(c: types.CallbackQuery):
@@ -276,13 +458,35 @@ async def paste_action(c: types.CallbackQuery):
     src = next((x for x in db["files"] if x["id"] == clip["id"]), None)
     if not src: return await c.answer("Item gone.")
 
+    # Check Collision
+    collision = check_collision(db, dest_id, src["name"], exclude_id=src["id"])
+    if collision:
+        # Save pending state for paste
+        db["pending_ops"][uid] = {
+            "type": "paste",
+            "data": {"dest_id": dest_id, "clip": clip, "src_id": src["id"]}
+        }
+        await save_db(db)
+        
+        await c.message.edit_text(
+            f"⚠️ **{src['name']}** exists in destination.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔁 Overwrite", callback_data="col_over")],
+                [InlineKeyboardButton(text="✏️ Rename", callback_data="col_ren")],
+                [InlineKeyboardButton(text="❌ Cancel", callback_data="col_cancel")]
+            ])
+        )
+        return
+
+    # No collision, execute
     if clip["op"] == "move":
         src["parent_id"] = dest_id
     elif clip["op"] == "copy":
-        def recursive_copy(item, new_parent):
+        def recursive_copy(item, new_parent, rename_to=None):
             new_entry = item.copy()
             new_entry["id"] = db["next_id"]
             new_entry["parent_id"] = new_parent
+            if rename_to: new_entry["name"] = rename_to
             db["files"].append(new_entry)
             db["next_id"] += 1
             if item["type"] == "folder":
