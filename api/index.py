@@ -10,6 +10,9 @@ from aiogram.types import (
     Update, BufferedInputFile, InlineKeyboardMarkup, 
     InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, ForceReply
 )
+from fastapi.responses import HTMLResponse, RedirectResponse
+import uuid
+from api.dashboard_html import HTML_CONTENT
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHANNEL_ID = os.environ.get("CHANNEL_ID")
@@ -681,9 +684,67 @@ async def sort_set(c: types.CallbackQuery):
 async def close_search(c: types.CallbackQuery):
     await c.message.delete()
 
+@dp.message(Command("login"))
+async def cmd_login(message: types.Message):
+    token = str(uuid.uuid4())
+    uid = str(message.from_user.id)
+    # Token valid for 1 hour
+    await r.setex(f"session:{token}", 3600, uid)
+    
+    # Construct URL
+    host = os.environ.get("VERCEL_URL", "example.com")
+    url = f"https://{host}/?token={token}"
+    
+    await message.answer(
+        f"🔐 **Dashboard Login**\n\nClick the link below to access your files on the web:\n\n[🔗 Open Dashboard]({url})\n\n_Link expires in 1 hour._",
+        parse_mode="Markdown"
+    )
+
+# --- Web Dashboard Endpoints ---
+
+@app.get("/", response_class=HTMLResponse)
+async def serve_dashboard():
+    return HTML_CONTENT
+
+@app.get("/api/verify")
+async def api_verify(token: str):
+    uid = await r.get(f"session:{token}")
+    if not uid: return {"status": "error"}, 401
+    return {"status": "ok", "uid": uid}
+
+@app.get("/api/files")
+async def api_files(token: str, folder: int = 0):
+    uid = await r.get(f"session:{token}")
+    if not uid: return {"error": "Unauthorized"}
+    uid = uid.decode('utf-8') if hasattr(uid, 'decode') else str(uid)
+    
+    db = await get_db()
+    res = [f for f in db["files"] if f.get("parent_id", 0) == folder]
+    return {"files": res}
+
+@app.get("/api/download/{item_id}")
+async def api_download(item_id: int, token: str):
+    uid = await r.get(f"session:{token}")
+    if not uid: return {"error": "Unauthorized"}
+    
+    db = await get_db()
+    item = next((x for x in db["files"] if x["id"] == item_id), None)
+    if not item: return {"error": "Not found"}
+    
+    try:
+        f = await bot.get_file(item["tg_id"])
+        host = "api.telegram.org"
+        dl_url = f"https://{host}/file/bot{BOT_TOKEN}/{f.file_path}"
+        return RedirectResponse(dl_url)
+    except Exception as e:
+        return {"error": str(e)}
+
 @app.post("/api/telegram")
 async def webhook(request: Request):
-    try: 
+    try:
+        data = await request.json()
+        update = Update(**data)
+        
         # Version Check
         curr_ver = os.environ.get("VERCEL_GIT_COMMIT_SHA")
         if curr_ver:
@@ -692,14 +753,24 @@ async def webhook(request: Request):
             
             if last_ver != curr_ver:
                 await r.set("app_version", curr_ver)
-                db = await get_db()
-                for uid in db["sessions"]:
+                
+                # Notify active user
+                uid = None
+                if update.message: uid = update.message.from_user.id
+                elif update.callback_query: uid = update.callback_query.from_user.id
+                
+                if uid:
                     try:
-                         await bot.send_message(uid, "🚀 **Update Detected!** Refreshing...", disable_notification=True)
-                         await render_browser(uid, db, db["sessions"][uid])
+                        msg = await bot.send_message(uid, "🚀 **Update Detected!**", disable_notification=True)
+                        # Auto-delete notification
+                        async def del_later(m):
+                            await asyncio.sleep(4)
+                            try: await m.delete()
+                            except: pass
+                        asyncio.create_task(del_later(msg))
                     except: pass
 
-        await dp.feed_update(bot, Update(**await request.json()))
+        await dp.feed_update(bot, update)
     except Exception as e:
         print(f"WEBHOOK ERROR: {e}")
     return {"status": "ok"}
