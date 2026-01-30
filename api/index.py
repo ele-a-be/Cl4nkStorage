@@ -196,6 +196,10 @@ async def create_new_folder(message: types.Message):
              return await message.answer("❌ Error: Folder name cannot be empty.")
 
         db = await get_db()
+        
+        if check_collision(db, pid, name):
+            return await message.answer("❌ Error: A folder/file with that name already exists.")
+            
         db["files"].append({"id": db["next_id"], "parent_id": pid, "name": name, "type": "folder"})
         db["next_id"] += 1
         await save_db(db)
@@ -327,7 +331,8 @@ async def resolve_col(c: types.CallbackQuery):
         if not src: return await c.answer("Source item missing.")
 
         if action == "over":
-            target = check_collision(db, pdata["dest_id"], src["name"], exclude_id=src["id"])
+            ex_id = src["id"] if pdata["clip"]["op"] == "move" else None
+            target = check_collision(db, pdata["dest_id"], src["name"], exclude_id=ex_id)
             if target:
                 db["files"] = [f for f in db["files"] if f["id"] != target["id"]]
             
@@ -459,7 +464,9 @@ async def paste_action(c: types.CallbackQuery):
     if not src: return await c.answer("Item gone.")
 
     # Check Collision
-    collision = check_collision(db, dest_id, src["name"], exclude_id=src["id"])
+    # Only exclude self if MOVING. If COPYING, self IS the collision in the same folder.
+    ex_id = src["id"] if clip["op"] == "move" else None
+    collision = check_collision(db, dest_id, src["name"], exclude_id=ex_id)
     if collision:
         # Save pending state for paste
         db["pending_ops"][uid] = {
