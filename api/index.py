@@ -710,7 +710,8 @@ async def serve_dashboard():
 async def api_verify(token: str):
     uid = await r.get(f"session:{token}")
     if not uid: return {"status": "error"}, 401
-    return {"status": "ok", "uid": uid}
+    uid_str = uid.decode('utf-8') if hasattr(uid, 'decode') else str(uid)
+    return {"status": "ok", "uid": uid_str}
 
 @app.get("/api/files")
 async def api_files(token: str, folder: int = 0):
