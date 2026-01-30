@@ -575,25 +575,9 @@ async def close_search(c: types.CallbackQuery):
     await c.message.delete()
 
 @app.post("/api/telegram")
-@dp.callback_query(F.data.startswith("ren_ask_"))
-async def ask_rename(cal: types.CallbackQuery):
-    print(f"DEBUG: ask_rename triggered with data: {cal.data}")
-    try:
-        iid = cal.data.split("_")[2]
-        await cal.message.answer(f"✏️ New name for item #{iid}:", reply_markup=ForceReply())
-        await cal.answer()
+async def webhook(request: Request):
+    try: 
+        await dp.feed_update(bot, Update(**await request.json()))
     except Exception as e:
-        print(f"DEBUG: ask_rename Failed: {e}")
-
-@dp.message(F.reply_to_message.text.contains("New name for item"))
-async def exec_rename(message: types.Message):
-    # ... rest of exec_rename is unchanged, but I don't want to replace it all if I can avoid it.
-    # But replace_file_content replaces the whole block.
-    # Wait, I just want to debug ask_rename and webhook. They are far apart.
-    # Can I do multi_replace equivalent?
-    # I should use multi_replace for this since they are far apart.
-    pass
-
-# Wait, I'll use separate calls or one call if I can.
-# use replace_file_content for webhook (at end) and ask_rename (in middle).
-# I'll do `webhook` first.
+        print(f"WEBHOOK ERROR: {e}")
+    return {"status": "ok"}
