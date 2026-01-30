@@ -192,7 +192,7 @@ async def create_new_folder(message: types.Message):
 
 @dp.callback_query(F.data.startswith("ren_ask_"))
 async def ask_rename(cal: types.CallbackQuery):
-    iid = cal.data.split("_")[1]
+    iid = cal.data.split("_")[2]
     await cal.message.answer(f"✏️ New name for item #{iid}:", reply_markup=ForceReply())
     await cal.answer()
 
